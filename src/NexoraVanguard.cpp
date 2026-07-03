@@ -6,6 +6,8 @@
 #include <strsafe.h>
 #include <tlhelp32.h>
 #include <stdint.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include "resource.h"
 
@@ -500,6 +502,229 @@ void ReleaseGameClientSlot() {
 
     g_clientSlotAcquired = false;
 }
+
+// ===================== NEXORA VANGUARD - ANTICHEAT REPORTING =====================
+
+// Report types sent to the Java server via TCP
+enum VanguardReportType {
+    ReportAntiCheatAlive    = 4
+};
+
+struct VanguardReport {
+    VanguardReportType type;
+    DWORD pid;
+    ULONGLONG timestamp;
+    wchar_t moduleName[128];
+    char extra[256];
+};
+
+// Forward declarations for anticheat subsystems
+bool ReportToServer(const VanguardReport& report);
+DWORD WINAPI MonitoringThread(LPVOID parameter);
+HANDLE g_monitorThread = nullptr;
+volatile LONG g_monitoringRunning = 0;
+char g_serverHost[128] = "127.0.0.1";
+DWORD g_serverPort = 5005;
+
+void WriteUInt32BE(unsigned char* out, DWORD value) {
+    out[0] = static_cast<unsigned char>((value >> 24) & 0xFF);
+    out[1] = static_cast<unsigned char>((value >> 16) & 0xFF);
+    out[2] = static_cast<unsigned char>((value >> 8) & 0xFF);
+    out[3] = static_cast<unsigned char>(value & 0xFF);
+}
+
+bool AppendBytes(unsigned char* out, size_t capacity, size_t& length, const void* data, size_t dataLength) {
+    if (dataLength > capacity || length > capacity - dataLength) {
+        return false;
+    }
+    CopyMemory(out + length, data, dataLength);
+    length += dataLength;
+    return true;
+}
+
+bool AppendByte(unsigned char* out, size_t capacity, size_t& length, unsigned char value) {
+    return AppendBytes(out, capacity, length, &value, sizeof(value));
+}
+
+bool AppendUInt16BE(unsigned char* out, size_t capacity, size_t& length, WORD value) {
+    unsigned char encoded[2] = {
+        static_cast<unsigned char>((value >> 8) & 0xFF),
+        static_cast<unsigned char>(value & 0xFF)
+    };
+    return AppendBytes(out, capacity, length, encoded, sizeof(encoded));
+}
+
+bool AppendUInt32BE(unsigned char* out, size_t capacity, size_t& length, DWORD value) {
+    unsigned char encoded[4];
+    WriteUInt32BE(encoded, value);
+    return AppendBytes(out, capacity, length, encoded, sizeof(encoded));
+}
+
+bool AppendJavaUtf(unsigned char* out, size_t capacity, size_t& length, const wchar_t* text) {
+    char utf8[1024] = {};
+    int required = WideCharToMultiByte(CP_UTF8, 0, text ? text : L"", -1, utf8, ARRAYSIZE(utf8), nullptr, nullptr);
+    if (required <= 0) {
+        return false;
+    }
+
+    int utf8Length = required - 1;
+    if (utf8Length < 0 || utf8Length > 0xFFFF) {
+        return false;
+    }
+
+    if (!AppendUInt16BE(out, capacity, length, static_cast<WORD>(utf8Length))) {
+        return false;
+    }
+    return AppendBytes(out, capacity, length, utf8, static_cast<size_t>(utf8Length));
+}
+
+bool BuildReportFrame(const VanguardReport& report, unsigned char* frame, size_t capacity, size_t& frameLength) {
+    frameLength = 4;
+    if (capacity < frameLength) {
+        return false;
+    }
+
+    if (!AppendUInt32BE(frame, capacity, frameLength, static_cast<DWORD>(report.type)) ||
+        !AppendUInt32BE(frame, capacity, frameLength, report.pid) ||
+        !AppendUInt32BE(frame, capacity, frameLength, static_cast<DWORD>(report.timestamp))) {
+        return false;
+    }
+
+    const wchar_t* moduleName = report.moduleName[0] ? report.moduleName : L"-";
+    if (!AppendJavaUtf(frame, capacity, frameLength, moduleName)) {
+        return false;
+    }
+
+    size_t extraLength = 0;
+    if (FAILED(StringCchLengthA(report.extra, ARRAYSIZE(report.extra), &extraLength))) {
+        extraLength = 0;
+    }
+    if (extraLength > 255) {
+        extraLength = 255;
+    }
+
+    if (!AppendByte(frame, capacity, frameLength, static_cast<unsigned char>(extraLength)) ||
+        !AppendBytes(frame, capacity, frameLength, report.extra, extraLength)) {
+        return false;
+    }
+
+    DWORD payloadLength = static_cast<DWORD>(frameLength - 4);
+    if (payloadLength == 0 || payloadLength > 8192) {
+        return false;
+    }
+
+    WriteUInt32BE(frame, payloadLength);
+    return true;
+}
+
+bool SendAll(SOCKET sock, const unsigned char* data, size_t length) {
+    size_t totalSent = 0;
+    while (totalSent < length) {
+        int chunkSize = static_cast<int>(length - totalSent);
+        int sent = send(sock, reinterpret_cast<const char*>(data + totalSent), chunkSize, 0);
+        if (sent <= 0) {
+            return false;
+        }
+        totalSent += static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+// ===================== ANTI-CHEAT TCP REPORTING TO JAVA SERVER =====================
+
+bool ReportToServer(const VanguardReport& report) {
+    static WSADATA wsaData = {};
+    static bool wsaInitialized = false;
+
+    if (!wsaInitialized) {
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            return false;
+        }
+        wsaInitialized = true;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        return false;
+    }
+
+    SOCKADDR_IN serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons((u_short)g_serverPort);
+    
+    if (InetPtonA(AF_INET, g_serverHost, &serverAddr.sin_addr) != 1) {
+        closesocket(sock);
+        return false;
+    }
+ 
+    // Timeout curto para não travar
+    DWORD timeout = 2000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) != 0) {
+        closesocket(sock);
+        return false;
+    }
+
+    unsigned char frame[8196] = {};
+    size_t frameLength = 0;
+    if (!BuildReportFrame(report, frame, ARRAYSIZE(frame), frameLength)) {
+        closesocket(sock);
+        return false;
+    }
+
+    bool sent = SendAll(sock, frame, frameLength);
+    closesocket(sock);
+
+    return sent;
+}
+
+// ===================== MONITORING THREAD =====================
+
+DWORD WINAPI MonitoringThread(LPVOID /*parameter*/) {
+    InterlockedExchange(&g_monitoringRunning, 1);
+
+    // Espera alguns segundos para o cliente estabilizar antes de começar a escanear
+    Sleep(5000);
+
+    while (InterlockedCompareExchange(&g_monitoringRunning, 0, 0) != 0) {
+        // TODO: Adicionar detecção de padrão de speed-hack aqui
+        // Ex: comparação de timestamps de movimento, análise de input rate
+        // Por enquanto só marcamos heartbeat para o servidor saber que estamos vivos
+        VanguardReport heartbeat = {};
+        heartbeat.type = ReportAntiCheatAlive;
+        heartbeat.pid = GetCurrentProcessId();
+        heartbeat.timestamp = GetTickCount64();
+        ReportToServer(heartbeat);
+
+        Sleep(20000);  // Heartbeat a cada 20s (não travar CPU)
+    }
+
+    return 0;
+}
+
+void StartMonitoringThread() {
+    if (g_monitorThread) {
+        return;
+    }
+
+    HANDLE thread = CreateThread(nullptr, 0, MonitoringThread, nullptr, 0, nullptr);
+    if (thread) {
+        g_monitorThread = thread;
+    }
+}
+
+void StopMonitoringThread() {
+    if (g_monitorThread) {
+        InterlockedExchange(&g_monitoringRunning, 0);
+        WaitForSingleObject(g_monitorThread, 5000);
+        CloseHandle(g_monitorThread);
+        g_monitorThread = nullptr;
+    }
+}
+
+// ===================== FIM DOS MÓDULOS ANTICHEAT =====================
 
 void ShowDualBoxBlockedDialogProcess() {
     wchar_t dllPath[MAX_PATH] = {};
@@ -2390,8 +2615,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
             return TRUE;
         }
         StartNexoraVanguard(instance);
+        StartMonitoringThread();  // Inicia thread de detecção após a UI subir
     } else if (reason == DLL_PROCESS_DETACH) {
         StopNexoraVanguard();
+        StopMonitoringThread();
         ReleaseGameClientSlot();
     }
 
