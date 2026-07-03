@@ -27,7 +27,7 @@ New-Item -ItemType Directory -Path (Join-Path $buildRoot 'x64') | Out-Null
 $msbuild = Resolve-MSBuild
 
 foreach ($platform in @('x86', 'x64')) {
-    & $msbuild $solution /m /restore /t:Build /p:Configuration=Release /p:Platform=$platform
+    & $msbuild $solution /m /restore /t:Build /p:Configuration=Release /p:Platform=$platform /p:PreferredToolArchitecture=x64
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
