@@ -177,6 +177,7 @@ bool g_trackingMouse = false;
 bool g_clientSlotAcquired = false;
 volatile LONG g_started = 0;
 volatile LONG g_stopping = 0;
+DWORD g_mainWindowLastClick = 0;
 
 void StartNexoraVanguard(HINSTANCE instance);
 
@@ -1735,7 +1736,7 @@ bool ReadRegDword(HKEY root, const wchar_t* subkey, const wchar_t* valueName, DW
     return true;
 }
 
-StatusKind DetectWindows25H2() {
+StatusKind DetectWindowsSupport() {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) {
         return StatusBad;
@@ -1752,7 +1753,11 @@ StatusKind DetectWindows25H2() {
         return StatusBad;
     }
 
-    if (os.dwMajorVersion > 10 || (os.dwMajorVersion == 10 && os.dwBuildNumber >= 26200)) {
+    if (os.dwMajorVersion > 10) {
+        return StatusOk;
+    }
+
+    if (os.dwMajorVersion == 10 && os.dwBuildNumber >= 10240) {
         return StatusOk;
     }
 
@@ -1830,9 +1835,9 @@ void SetRequirement(int index, const wchar_t* title, const wchar_t* detail, Stat
 void RefreshRequirements() {
     SetRequirement(
         0,
-        L"Windows 11 25H2 ou posterior",
-        L"Manter o Windows atualizado ajuda a garantir recursos de seguranca recentes que o Nexora Vanguard usa durante o jogo.",
-        DetectWindows25H2());
+        L"Windows 10/11",
+        L"O Nexora Vanguard funciona em Windows 10 ou superior, com verificacoes adicionais quando o recurso estiver disponivel.",
+        DetectWindowsSupport());
 
     SetRequirement(
         1,
@@ -2163,11 +2168,12 @@ void DrawMenuWindow(HWND hwnd, HDC hdc) {
 
 void DestroyCustomMenu() {
     if (g_menuWindow && IsWindow(g_menuWindow)) {
+        KillTimer(g_menuWindow, 1);
         DestroyWindow(g_menuWindow);
-        return;
+        g_menuWindow = nullptr;
     }
 
-    g_menuWindow = nullptr;
+
     g_menuOwner = nullptr;
     g_menuHover = -1;
     g_menuItemCount = 0;
@@ -2284,6 +2290,9 @@ void ShowMenu(HWND hwnd, POINT screenPoint) {
         return;
     }
 
+    SetWindowLongPtrW(g_menuWindow, GWLP_USERDATA, 1);
+    SetTimer(g_menuWindow, 1, 120, nullptr);
+
     HRGN region = CreateRoundRectRgn(0, 0, kMenuWidth + 1, g_menuHeight + 1, 10, 10);
     SetWindowRgn(g_menuWindow, region, TRUE);
     ShowWindow(g_menuWindow, SW_SHOWNOACTIVATE);
@@ -2371,6 +2380,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
 
         if (ContainsPoint(MenuButtonRect(), x, y)) {
+            if (IsWindowVisible(hwnd)) {
+                HideMainWindow(hwnd);
+                return 0;
+            }
+
             RECT menuRect = MenuButtonRect();
             POINT point = { menuRect.left, menuRect.bottom + 5 };
             ClientToScreen(hwnd, &point);
@@ -2382,15 +2396,59 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             HideMainWindow(hwnd);
             return 0;
         }
+
+        if (!IsWindowVisible(hwnd)) {
+            ShowMainWindow(hwnd);
+            return 0;
+        }
+
+        DWORD now = GetTickCount();
+        if (now - g_mainWindowLastClick < 400) {
+            HideMainWindow(hwnd);
+            g_mainWindowLastClick = 0;
+            return 0;
+        }
+
+        g_mainWindowLastClick = now;
         return 0;
     }
 
     case WM_RBUTTONUP: {
-        POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        POINT point = {
+            GET_X_LPARAM(lParam),
+            GET_Y_LPARAM(lParam)
+        };
+
         ClientToScreen(hwnd, &point);
+
+        if (IsWindow(g_menuWindow)) {
+            DestroyCustomMenu();
+            return 0;
+        }
+
         ShowMenu(hwnd, point);
         return 0;
     }
+
+    case WM_TIMER:
+        if (wParam == 1) {
+            POINT cursor;
+            if (GetCursorPos(&cursor)) {
+                HWND under = WindowFromPoint(cursor);
+                if (under && under != hwnd && under != g_menuWindow && !IsChild(hwnd, under) && !IsChild(g_menuWindow, under)) {
+                    HideMainWindow(hwnd);
+                    DestroyCustomMenu();
+                }
+            }
+            return 0;
+        }
+
+        if (hwnd == g_menuWindow) {
+            KillTimer(hwnd, 1);
+            DestroyCustomMenu();
+            return 0;
+        }
+        return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -2422,11 +2480,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             ToggleMainWindow(hwnd);
             return 0;
         }
+
         if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) {
             POINT point = {};
             GetCursorPos(&point);
             ShowMenu(hwnd, point);
             return 0;
+        }
+        return 0;
+
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE && IsWindowVisible(hwnd) && !IsWindow(g_menuWindow)) {
+            HideMainWindow(hwnd);
         }
         return 0;
 
